@@ -1,0 +1,545 @@
+"""
+中学自动调课系统 - 数据库模块
+使用SQLite进行数据持久化
+"""
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+import pandas as pd
+
+# 数据库路径
+DB_PATH = Path(__file__).parent / "data" / "schedule.db"
+
+class Database:
+    """数据库操作类"""
+    
+    def __init__(self):
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._init_tables()
+    
+    def _init_tables(self):
+        """初始化数据库表"""
+        cursor = self.conn.cursor()
+        
+        # 用户表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('admin', '教务')),
+                name TEXT,
+                teacher_id INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # 教师表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS teachers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                course_types TEXT DEFAULT '',
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # 班级表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS classes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                grade TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # 课表明细表 (每条记录：班级+星期+节次 -> 教师+课程)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id INTEGER NOT NULL,
+                day_of_week INTEGER NOT NULL,
+                period INTEGER NOT NULL,
+                teacher_id INTEGER NOT NULL,
+                course_name TEXT,
+                is_evening INTEGER DEFAULT 0,
+                FOREIGN KEY (class_id) REFERENCES classes(id),
+                FOREIGN KEY (teacher_id) REFERENCES teachers(id),
+                UNIQUE(class_id, day_of_week, period)
+            )
+        """)
+        
+        # 晚自习轮值表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS evening_rotation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_id INTEGER NOT NULL,
+                order_index INTEGER NOT NULL,
+                semester TEXT DEFAULT '2024-2025-1',
+                FOREIGN KEY (teacher_id) REFERENCES teachers(id)
+            )
+        """)
+        
+        # 当前晚自习指针
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS evening_pointer (
+                id INTEGER PRIMARY KEY,
+                current_index INTEGER DEFAULT -1,
+                semester TEXT DEFAULT '2024-2025-1',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # 顶课记录表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS substitutions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                absent_teacher_id INTEGER NOT NULL,
+                substitute_teacher_id INTEGER,
+                class_id INTEGER NOT NULL,
+                day_of_week INTEGER NOT NULL,
+                period INTEGER NOT NULL,
+                course_type TEXT NOT NULL,
+                original_course TEXT,
+                status TEXT DEFAULT 'pending',
+                created_by INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (absent_teacher_id) REFERENCES teachers(id),
+                FOREIGN KEY (substitute_teacher_id) REFERENCES teachers(id),
+                FOREIGN KEY (class_id) REFERENCES classes(id),
+                FOREIGN KEY (created_by) REFERENCES users(id)
+            )
+        """)
+        
+        # 通知表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                title TEXT NOT NULL,
+                content TEXT,
+                is_read INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # 创建默认用户
+        cursor.execute("SELECT COUNT(*) FROM users")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute(
+                "INSERT INTO users (username, password, role, name) VALUES (?, ?, ?, ?)",
+                ('admin', 'admin123', 'admin', '系统管理员')
+            )
+            cursor.execute(
+                "INSERT INTO users (username, password, role, name) VALUES (?, ?, ?, ?)",
+                ('jiaowu', 'jiaowu123', '教务', '教务员')
+            )
+        
+        # 初始化晚自习指针
+        cursor.execute("SELECT COUNT(*) FROM evening_pointer")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("INSERT INTO evening_pointer (id, current_index) VALUES (1, -1)")
+        
+        self.conn.commit()
+    
+    # ==================== 用户相关 ====================
+    
+    def check_login(self, username, password):
+        """验证登录"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT id, username, role, name, teacher_id FROM users WHERE username = ? AND password = ?",
+            (username, password)
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    
+    def get_user(self, user_id):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    
+    def get_teachers_for_user(self):
+        """获取可以作为用户的教师列表"""
+        df = pd.read_sql("""
+            SELECT t.*, u.id as user_id, u.username 
+            FROM teachers t 
+            LEFT JOIN users u ON t.id = u.teacher_id AND u.role = '教师'
+            WHERE t.is_active = 1 
+            ORDER BY t.name
+        """, self.conn)
+        return df
+    
+    # ==================== 教师相关 ====================
+    
+    def import_teachers(self, teachers_list):
+        cursor = self.conn.cursor()
+        for name in teachers_list:
+            cursor.execute("INSERT OR IGNORE INTO teachers (name) VALUES (?)", (name,))
+        self.conn.commit()
+    
+    def get_all_teachers(self):
+        df = pd.read_sql("SELECT * FROM teachers WHERE is_active = 1 ORDER BY name", self.conn)
+        return df
+    
+    def get_teacher(self, teacher_id):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM teachers WHERE id = ?", (teacher_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    
+    def get_teacher_by_name(self, name):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM teachers WHERE name = ?", (name,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    
+    def get_teacher_courses(self, teacher_id):
+        """获取某教师的所有课程"""
+        df = pd.read_sql("""
+            SELECT s.*, c.name as class_name, c.grade
+            FROM schedule_items s
+            JOIN classes c ON s.class_id = c.id
+            WHERE s.teacher_id = ?
+            ORDER BY s.day_of_week, s.period
+        """, self.conn, params=(teacher_id,))
+        return df
+    
+    def get_teacher_schedule_by_day(self, teacher_id, day_of_week):
+        """获取教师某一天的课表"""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT s.*, c.name as class_name, c.grade,
+                   CASE WHEN sub.id IS NOT NULL THEN 1 ELSE 0 END as is_substituted,
+                   sub.substitute_teacher_id, sub.status as sub_status
+            FROM schedule_items s
+            JOIN classes c ON s.class_id = c.id
+            LEFT JOIN substitutions sub ON s.teacher_id = sub.absent_teacher_id 
+                AND s.class_id = sub.class_id 
+                AND s.day_of_week = sub.day_of_week 
+                AND s.period = sub.period
+                AND sub.status = 'confirmed'
+            WHERE s.teacher_id = ? AND s.day_of_week = ?
+        """, (teacher_id, day_of_week))
+        return [dict(row) for row in cursor.fetchall()]
+    
+    # ==================== 班级相关 ====================
+    
+    def import_classes(self, classes_list):
+        cursor = self.conn.cursor()
+        for name, grade in classes_list:
+            cursor.execute(
+                "INSERT OR IGNORE INTO classes (name, grade) VALUES (?, ?)",
+                (name, grade)
+            )
+        self.conn.commit()
+    
+    def get_all_classes(self):
+        df = pd.read_sql("SELECT * FROM classes ORDER BY grade, name", self.conn)
+        return df
+    
+    def get_class(self, class_id):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM classes WHERE id = ?", (class_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    
+    def get_class_by_name(self, name):
+        """根据名称获取班级"""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM classes WHERE name = ?", (name,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    
+    def get_class_schedule(self, class_id):
+        """获取班级课表"""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT s.*, t.name as teacher_name, c.grade
+            FROM schedule_items s
+            JOIN teachers t ON s.teacher_id = t.id
+            JOIN classes c ON s.class_id = c.id
+            WHERE s.class_id = ?
+            ORDER BY s.day_of_week, s.period
+        """, (class_id,))
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def get_class_teachers(self, class_id):
+        """获取某班级所有任课老师"""
+        df = pd.read_sql("""
+            SELECT DISTINCT t.id, t.name, t.course_types
+            FROM schedule_items s
+            JOIN teachers t ON s.teacher_id = t.id
+            WHERE s.class_id = ? AND t.is_active = 1
+            ORDER BY t.name
+        """, self.conn, params=(class_id,))
+        return df
+    
+    # ==================== 课表相关 ====================
+    
+    def import_schedule(self, schedule_list):
+        """批量导入课表"""
+        cursor = self.conn.cursor()
+        for item in schedule_list:
+            cursor.execute("""
+                INSERT OR REPLACE INTO schedule_items 
+                (class_id, day_of_week, period, teacher_id, course_name, is_evening)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (item['class_id'], item['day_of_week'], item['period'], 
+                  item['teacher_id'], item['course_name'], item.get('is_evening', 0)))
+        self.conn.commit()
+    
+    def clear_schedule(self):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM schedule_items")
+        cursor.execute("DELETE FROM teachers")
+        cursor.execute("DELETE FROM classes")
+        self.conn.commit()
+    
+    def get_available_teachers_for_class(self, class_id, day_of_week, period, exclude_teachers=None):
+        """获取某班级某时段可顶课的教师（正课）"""
+        cursor = self.conn.cursor()
+        exclude = exclude_teachers or []
+        
+        # 获取该班级所有任课老师中该时段空闲的
+        query = """
+            SELECT DISTINCT t.id, t.name, t.course_types
+            FROM teachers t
+            JOIN schedule_items s ON t.id = s.teacher_id
+            WHERE s.class_id = ? 
+            AND t.id NOT IN (
+                SELECT teacher_id FROM schedule_items 
+                WHERE class_id = ? AND day_of_week = ? AND period = ?
+            )
+            AND t.is_active = 1
+        """
+        
+        params = [class_id, class_id, day_of_week, period]
+        
+        # 如果有排除的教师
+        if exclude:
+            placeholders = ','.join(['?'] * len(exclude))
+            query += f" AND t.id NOT IN ({placeholders})"
+            params.extend(exclude)
+        
+        query += " ORDER BY t.name"
+        
+        df = pd.read_sql(query, self.conn, params=params)
+        return df
+    
+    # ==================== 晚自习轮值相关 ====================
+    
+    def set_evening_rotation(self, teacher_ids):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM evening_rotation")
+        cursor.execute("UPDATE evening_pointer SET current_index = -1")
+        for idx, tid in enumerate(teacher_ids):
+            cursor.execute(
+                "INSERT INTO evening_rotation (teacher_id, order_index) VALUES (?, ?)",
+                (tid, idx)
+            )
+        self.conn.commit()
+    
+    def get_evening_rotation(self):
+        df = pd.read_sql("""
+            SELECT r.*, t.name as teacher_name
+            FROM evening_rotation r
+            JOIN teachers t ON r.teacher_id = t.id
+            ORDER BY r.order_index
+        """, self.conn)
+        return df
+    
+    def assign_evening_duty(self):
+        """分配下一个晚自习值班教师"""
+        cursor = self.conn.cursor()
+        
+        # 获取当前指针
+        cursor.execute("SELECT current_index FROM evening_pointer WHERE id = 1")
+        row = cursor.fetchone()
+        current = row['current_index'] if row else -1
+        
+        # 获取轮值表长度
+        cursor.execute("SELECT COUNT(*) FROM evening_rotation")
+        total = cursor.fetchone()[0]
+        
+        if total == 0:
+            return None
+        
+        # 下一个
+        next_idx = (current + 1) % total
+        cursor.execute("""
+            SELECT r.*, t.name as teacher_name
+            FROM evening_rotation r
+            JOIN teachers t ON r.teacher_id = t.id
+            WHERE r.order_index = ?
+        """, (next_idx,))
+        
+        row = cursor.fetchone()
+        if row:
+            cursor.execute(
+                "UPDATE evening_pointer SET current_index = ?, updated_at = ? WHERE id = 1",
+                (next_idx, datetime.now().isoformat())
+            )
+            self.conn.commit()
+            return dict(row)
+        return None
+    
+    def get_current_evening_teacher(self):
+        """获取当前晚自习值班教师"""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT current_index FROM evening_pointer WHERE id = 1")
+        row = cursor.fetchone()
+        current = row['current_index'] if row else -1
+        
+        if current < 0:
+            return None
+        
+        cursor.execute("""
+            SELECT r.*, t.name as teacher_name
+            FROM evening_rotation r
+            JOIN teachers t ON r.teacher_id = t.id
+            WHERE r.order_index = ?
+        """, (current,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    
+    # ==================== 顶课记录相关 ====================
+    
+    def create_substitution(self, data):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO substitutions 
+            (absent_teacher_id, substitute_teacher_id, class_id, day_of_week, period,
+             course_type, original_course, status, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data['absent_teacher_id'],
+            data.get('substitute_teacher_id'),
+            data['class_id'],
+            data['day_of_week'],
+            data['period'],
+            data['course_type'],
+            data.get('original_course', ''),
+            data.get('status', 'pending'),
+            data.get('created_by')
+        ))
+        self.conn.commit()
+        return cursor.lastrowid
+    
+    def get_substitutions(self, filters=None):
+        query = """
+            SELECT sub.*,
+                   at.name as absent_teacher_name,
+                   st.name as substitute_teacher_name,
+                   c.name as class_name, c.grade
+            FROM substitutions sub
+            JOIN teachers at ON sub.absent_teacher_id = at.id
+            LEFT JOIN teachers st ON sub.substitute_teacher_id = st.id
+            JOIN classes c ON sub.class_id = c.id
+        """
+        params = []
+        conditions = []
+        
+        if filters:
+            if filters.get('absent_teacher_id'):
+                conditions.append("sub.absent_teacher_id = ?")
+                params.append(filters['absent_teacher_id'])
+            if filters.get('substitute_teacher_id'):
+                conditions.append("sub.substitute_teacher_id = ?")
+                params.append(filters['substitute_teacher_id'])
+            if filters.get('course_type'):
+                conditions.append("sub.course_type = ?")
+                params.append(filters['course_type'])
+            if filters.get('status'):
+                conditions.append("sub.status = ?")
+                params.append(filters['status'])
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        
+        query += " ORDER BY sub.day_of_week, sub.period"
+        
+        df = pd.read_sql(query, self.conn, params=params)
+        return df
+    
+    def get_my_substitutions(self, teacher_id):
+        df = pd.read_sql("""
+            SELECT sub.*,
+                   at.name as absent_teacher_name,
+                   c.name as class_name, c.grade
+            FROM substitutions sub
+            JOIN teachers at ON sub.absent_teacher_id = at.id
+            JOIN classes c ON sub.class_id = c.id
+            WHERE sub.substitute_teacher_id = ? AND sub.status = 'confirmed'
+            ORDER BY sub.day_of_week, sub.period
+        """, self.conn, params=(teacher_id,))
+        return df
+    
+    def update_substitution(self, sub_id, substitute_id, status='confirmed'):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            UPDATE substitutions 
+            SET substitute_teacher_id = ?, status = ?, created_at = ?
+            WHERE id = ?
+        """, (substitute_id, status, datetime.now().isoformat(), sub_id))
+        self.conn.commit()
+    
+    # ==================== 通知相关 ====================
+    
+    def add_notification(self, user_id, title, content):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO notifications (user_id, title, content) VALUES (?, ?, ?)",
+            (user_id, title, content)
+        )
+        self.conn.commit()
+    
+    def get_notifications(self, user_id=None, unread_only=False):
+        query = "SELECT * FROM notifications"
+        params = []
+        conditions = []
+        
+        if user_id:
+            conditions.append("user_id = ?")
+            params.append(user_id)
+        if unread_only:
+            conditions.append("is_read = 0")
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        
+        query += " ORDER BY created_at DESC LIMIT 50"
+        
+        df = pd.read_sql(query, self.conn, params=params)
+        return df
+    
+    def mark_read(self, notification_id):
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE notifications SET is_read = 1 WHERE id = ?", (notification_id,))
+        self.conn.commit()
+    
+    def get_unread_count(self, user_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0",
+            (user_id,)
+        )
+        return cursor.fetchone()[0]
+    
+    def close(self):
+        self.conn.close()
+
+
+# 单例
+_db = None
+
+def get_db():
+    global _db
+    if _db is None:
+        _db = Database()
+    return _db
