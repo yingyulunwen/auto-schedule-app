@@ -10,6 +10,12 @@ import pandas as pd
 # 数据库路径
 DB_PATH = Path(__file__).parent / "data" / "schedule.db"
 
+# 科目顺序列表（固定顺序，用于顶课分配）
+COURSE_ORDER = [
+    '语文', '数学', '英语', '物理', '化学', '道法', '历史', '生物', 
+    '地理', '音乐', '体育', '美术', '信息技术', '劳动'
+]
+
 class Database:
     """数据库操作类"""
     
@@ -93,12 +99,6 @@ class Database:
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
-        # 科目顺序列表（固定顺序，用于顶课分配）
-        COURSE_ORDER = [
-            '语文', '数学', '英语', '物理', '化学', '道法', '历史', '生物', 
-            '地理', '音乐', '体育', '美术', '信息技术', '劳动'
-        ]
         
         # 教师排课冲突记录表
         cursor.execute("""
