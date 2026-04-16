@@ -1,11 +1,12 @@
 """
 中学自动调课系统 - Streamlit Web应用
 5个页面：首页、发起顶课、课表页、晚自习轮值、个人中心
+支持科目顺序排课、手动选择教师和冲突记录
 """
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from database import get_db
+from database import get_db, COURSE_ORDER
 from schedule_parser import import_schedule_to_db, get_statistics
 from substitution_engine import create_substitution_records, DAY_NAMES, PERIOD_NAMES
 
@@ -22,6 +23,8 @@ if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
 if 'user' not in st.session_state:
     st.session_state.user = None
+if 'substitution_results' not in st.session_state:
+    st.session_state.substitution_results = None
 
 # ==================== 登录函数 ====================
 
@@ -37,6 +40,7 @@ def login(username, password):
 def logout():
     st.session_state.logged_in = False
     st.session_state.user = None
+    st.session_state.substitution_results = None
 
 # ==================== 侧边栏 ====================
 
@@ -178,6 +182,13 @@ def render_home_page():
     st.markdown("---")
     if stats['teachers_count'] == 0:
         st.warning("⚠️ 尚未导入课表数据，请先点击侧边栏的「数据初始化」按钮。")
+    
+    # 科目顺序说明
+    st.markdown("---")
+    st.markdown("### 📋 顶课科目顺序")
+    st.caption("顶课时按以下科目顺序安排教师：")
+    order_str = " → ".join(COURSE_ORDER)
+    st.info(order_str)
 
 # ==================== 发起顶课页面 ====================
 
@@ -192,6 +203,17 @@ def render_substitution_page():
     if teachers.empty:
         st.warning("⚠️ 尚未导入课表数据，请先在首页初始化数据。")
         return
+    
+    # 显示科目顺序说明
+    with st.expander("📋 顶课科目顺序说明", expanded=False):
+        st.markdown("顶课时系统按以下固定科目顺序安排教师：")
+        order_str = " → ".join(COURSE_ORDER)
+        st.info(order_str)
+        st.caption("""
+        - 当某科目教师有冲突时，自动跳过并尝试下一科目
+        - 被跳过的教师会在后续排课中优先考虑
+        - 如需手动调整，可点击「手动选择」按钮
+        """)
     
     # 步骤1：选择请假教师
     st.markdown("#### 步骤1：选择请假教师")
@@ -274,40 +296,140 @@ def render_substitution_page():
                 with st.spinner("正在生成调课方案..."):
                     results = create_substitution_records(
                         selected_periods,
-                        created_by=st.session_state.user['id']
+                        created_by=st.session_state.user['id'],
+                        operated_by=st.session_state.user['id']
                     )
                 
                 if results:
+                    st.session_state.substitution_results = results
                     st.success(f"✅ 已成功生成 **{len(results)}条** 调课记录")
-                    
-                    # 显示结果
-                    st.markdown("##### 📋 调课结果")
-                    
-                    results_df = pd.DataFrame(results)
-                    display_results = results_df[['day', 'period', 'class', 'course', 'course_type', 'substitute_teacher', 'status']].copy()
-                    display_results.columns = ['星期', '节次', '班级', '课程', '类型', '顶替教师', '状态']
-                    
-                    st.dataframe(display_results, use_container_width=True, hide_index=True)
-                    
-                    # 统计
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("✅ 已安排", len([r for r in results if r['status'] == '已安排']))
-                    with col2:
-                        failed = len([r for r in results if r['status'] != '已安排'])
-                        st.metric("⚠️ 待手动处理", failed, delta="需要人工处理" if failed > 0 else None)
-                    
-                    # 导出功能
-                    csv = display_results.to_csv(index=False).encode('utf-8-sig')
-                    st.download_button(
-                        "📥 下载调课方案 (CSV)",
-                        csv,
-                        f"调课方案_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        "text/csv",
-                        use_container_width=True
-                    )
+                    st.rerun()
                 else:
                     st.error("生成调课方案失败")
+    
+    # 显示调课结果和处理界面
+    if st.session_state.substitution_results:
+        st.markdown("---")
+        st.markdown("#### 步骤4：确认/调整调课方案")
+        
+        results = st.session_state.substitution_results
+        db = get_db()
+        
+        # 显示每条记录的详细信息
+        for i, result in enumerate(results):
+            with st.container():
+                st.markdown(f"##### 📌 {result['day']} {result['period']} - {result['class']} - {result['course']}")
+                
+                col1, col2, col3 = st.columns([2, 2, 3])
+                
+                with col1:
+                    st.markdown(f"**请假教师:** {result['absent_teacher']}")
+                
+                with col2:
+                    if result['status'] == '已安排':
+                        st.markdown(f"**顶替教师:** {result['substitute_teacher']}")
+                        assignment_badge = "🔄 自动" if result.get('assignment_type', '').startswith('auto') else "✋ 手动"
+                        st.caption(f"{assignment_badge} | {result['message']}")
+                    else:
+                        st.markdown("**顶替教师:** 待分配")
+                        st.caption("⚠️ " + result['message'])
+                
+                # 手动选择功能
+                with col3:
+                    if result['course_type'] != '晚自习':  # 只对正课提供手动选择
+                        available_teachers = result.get('all_available', [])
+                        conflict_teachers = result.get('conflict_teachers', [])
+                        
+                        if available_teachers or conflict_teachers:
+                            # 构建教师选项
+                            teacher_options = []
+                            teacher_map = {}
+                            
+                            # 优先显示可用教师
+                            if available_teachers:
+                                teacher_options.append("--- 可用教师 ---")
+                                for t in available_teachers:
+                                    label = f"{t['name']} ({t.get('course_types', '未知')})"
+                                    teacher_options.append(label)
+                                    teacher_map[label] = t['id']
+                            
+                            # 显示冲突教师
+                            if conflict_teachers:
+                                teacher_options.append("--- 冲突教师(已被分配) ---")
+                                for t in conflict_teachers:
+                                    label = f"{t['name']} ({t.get('course', '未知')}) ⚠️"
+                                    teacher_options.append(label)
+                                    teacher_map[label] = t['id']
+                            
+                            # 手动选择下拉框
+                            selected_option = st.selectbox(
+                                "手动选择顶替教师",
+                                options=["(保持自动分配)"] + teacher_options,
+                                key=f"manual_select_{i}",
+                                label_visibility="collapsed"
+                            )
+                            
+                            if selected_option != "(保持自动分配)" and selected_option in teacher_map:
+                                manual_teacher_id = teacher_map[selected_option]
+                                if st.button(f"✅ 确认选择", key=f"confirm_{i}"):
+                                    # 更新记录
+                                    db.update_substitution_manual(
+                                        result['id'],
+                                        manual_teacher_id,
+                                        st.session_state.user['id']
+                                    )
+                                    st.success(f"已手动指定 {selected_option.split(' (')[0]} 顶课")
+                                    st.session_state.substitution_results = None
+                                    st.rerun()
+                
+                # 显示冲突教师信息
+                conflict = result.get('conflict_teachers', [])
+                if conflict:
+                    st.caption(f"⚠️ 以下教师有冲突: {', '.join([c['name'] for c in conflict])}")
+                
+                st.markdown("---")
+        
+        # 统计和操作
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("✅ 已安排", len([r for r in results if r['status'] == '已安排']))
+        with col2:
+            failed = len([r for r in results if r['status'] != '已安排'])
+            st.metric("⚠️ 待手动处理", failed, delta="需要人工处理" if failed > 0 else None)
+        with col3:
+            st.metric("📊 总计", len(results))
+        
+        # 导出功能
+        if st.button("📥 下载调课方案 (CSV)", use_container_width=True):
+            display_results = []
+            for r in results:
+                display_results.append({
+                    '星期': r['day'],
+                    '节次': r['period'],
+                    '班级': r['class'],
+                    '课程': r['course'],
+                    '类型': r['course_type'],
+                    '请假教师': r['absent_teacher'],
+                    '顶替教师': r['substitute_teacher'],
+                    '分配方式': '手动' if r.get('assignment_type') == 'manual' else '自动',
+                    '状态': r['status']
+                })
+            
+            df = pd.DataFrame(display_results)
+            csv = df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                "📥 确认下载",
+                csv,
+                f"调课方案_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                "text/csv",
+                use_container_width=True
+            )
+        
+        # 完成按钮
+        if st.button("✅ 完成调课", type="primary", use_container_width=True):
+            st.session_state.substitution_results = None
+            st.success("调课已完成！")
+            st.rerun()
 
 # ==================== 课表查询页面 ====================
 
@@ -479,6 +601,17 @@ def render_evening_rotation_page():
                     db.set_evening_rotation(new_ids)
                     st.success("✅ 轮值顺序已更新")
                     st.rerun()
+        
+        # 冲突记录管理
+        st.markdown("---")
+        st.markdown("#### 🗑️ 冲突记录管理 (管理员)")
+        
+        if st.button("🗑️ 清除所有冲突记录"):
+            db.clear_skipped_teachers()
+            st.success("✅ 已清除所有冲突记录")
+            st.rerun()
+        
+        st.caption("清除冲突记录后，系统将重新按科目顺序分配顶课")
 
 # ==================== 个人中心页面 ====================
 
@@ -539,10 +672,12 @@ def render_profile_page():
         my_duties = my_subs
     
     if not my_duties.empty:
-        display_df = my_duties[['day_of_week', 'period', 'class_name', 'absent_teacher_name', 'original_course']].copy()
+        display_df = my_duties[['day_of_week', 'period', 'class_name', 'absent_teacher_name', 'original_course', 'assignment_type']].copy()
         display_df['day_of_week'] = display_df['day_of_week'].map(DAY_NAMES)
         display_df['period'] = display_df['period'].map(PERIOD_NAMES)
-        display_df.columns = ['星期', '节次', '班级', '原任课教师', '课程']
+        display_df['分配方式'] = display_df['assignment_type'].apply(lambda x: '手动' if x == 'manual' else '自动')
+        display_df = display_df[['day_of_week', 'period', 'class_name', 'absent_teacher_name', 'original_course', '分配方式']]
+        display_df.columns = ['星期', '节次', '班级', '原任课教师', '课程', '分配方式']
         
         st.dataframe(display_df, use_container_width=True, hide_index=True)
         st.caption(f"共有 {len(my_duties)} 条顶课记录")
@@ -584,11 +719,15 @@ def render_profile_page():
             # 显示
             display_df = filtered[['created_at', 'day_of_week', 'period', 'class_name', 
                                    'absent_teacher_name', 'substitute_teacher_name', 
-                                   'original_course', 'course_type', 'status']].copy()
+                                   'original_course', 'course_type', 'assignment_type', 'status']].copy()
             display_df['day_of_week'] = display_df['day_of_week'].map(DAY_NAMES)
             display_df['period'] = display_df['period'].map(PERIOD_NAMES)
+            display_df['分配方式'] = display_df['assignment_type'].apply(lambda x: '手动' if x == 'manual' else '自动')
+            display_df = display_df[['created_at', 'day_of_week', 'period', 'class_name', 
+                                     'absent_teacher_name', 'substitute_teacher_name', 
+                                     'original_course', 'course_type', '分配方式', 'status']]
             display_df.columns = ['创建时间', '星期', '节次', '班级', '请假教师', 
-                                   '顶替教师', '课程', '类型', '状态']
+                                   '顶替教师', '课程', '类型', '分配方式', '状态']
             display_df['创建时间'] = pd.to_datetime(display_df['创建时间']).dt.strftime('%m-%d %H:%M')
             
             st.dataframe(display_df, use_container_width=True, hide_index=True)

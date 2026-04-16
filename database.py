@@ -94,6 +94,30 @@ class Database:
             )
         """)
         
+        # 科目顺序列表（固定顺序，用于顶课分配）
+COURSE_ORDER = [
+    '语文', '数学', '英语', '物理', '化学', '道法', '历史', '生物', 
+    '地理', '音乐', '体育', '美术', '信息技术', '劳动'
+]
+
+# 教师排课冲突记录表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS teacher_skip_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_id INTEGER NOT NULL,
+                class_id INTEGER NOT NULL,
+                day_of_week INTEGER NOT NULL,
+                period INTEGER NOT NULL,
+                reason TEXT DEFAULT 'conflict',
+                semester TEXT DEFAULT '2024-2025-1',
+                skip_count INTEGER DEFAULT 1,
+                last_skip_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (teacher_id) REFERENCES teachers(id),
+                FOREIGN KEY (class_id) REFERENCES classes(id),
+                UNIQUE(teacher_id, class_id, day_of_week, period, semester)
+            )
+        """)
+        
         # 顶课记录表
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS substitutions (
@@ -105,13 +129,17 @@ class Database:
                 period INTEGER NOT NULL,
                 course_type TEXT NOT NULL,
                 original_course TEXT,
-                status TEXT DEFAULT 'pending',
+                assignment_type TEXT DEFAULT 'auto',
                 created_by INTEGER,
+                operated_by INTEGER,
+                operated_at TEXT,
+                status TEXT DEFAULT 'pending',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (absent_teacher_id) REFERENCES teachers(id),
                 FOREIGN KEY (substitute_teacher_id) REFERENCES teachers(id),
                 FOREIGN KEY (class_id) REFERENCES classes(id),
-                FOREIGN KEY (created_by) REFERENCES users(id)
+                FOREIGN KEY (created_by) REFERENCES users(id),
+                FOREIGN KEY (operated_by) REFERENCES users(id)
             )
         """)
         
@@ -530,6 +558,146 @@ class Database:
             (user_id,)
         )
         return cursor.fetchone()[0]
+    
+    # ==================== 冲突记录相关 ====================
+    
+    def record_teacher_skip(self, teacher_id, class_id, day_of_week, period, reason='conflict'):
+        """记录教师被跳过（冲突）"""
+        cursor = self.conn.cursor()
+        semester = '2024-2025-1'
+        now = datetime.now().isoformat()
+        
+        # 使用 INSERT OR UPDATE 语法
+        cursor.execute("""
+            INSERT INTO teacher_skip_records 
+            (teacher_id, class_id, day_of_week, period, reason, semester, last_skip_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(teacher_id, class_id, day_of_week, period, semester) 
+            DO UPDATE SET 
+                skip_count = skip_count + 1,
+                last_skip_at = excluded.last_skip_at,
+                reason = excluded.reason
+        """, (teacher_id, class_id, day_of_week, period, reason, semester, now))
+        self.conn.commit()
+    
+    def get_skipped_teachers(self, class_id, day_of_week, period):
+        """获取被跳过过的教师列表（按跳过次数降序）"""
+        cursor = self.conn.cursor()
+        semester = '2024-2025-1'
+        
+        cursor.execute("""
+            SELECT t.id, t.name, s.skip_count, s.last_skip_at
+            FROM teacher_skip_records s
+            JOIN teachers t ON s.teacher_id = t.id
+            WHERE s.class_id = ? AND s.day_of_week = ? AND s.period = ? 
+            AND s.semester = ?
+            ORDER BY s.skip_count DESC, s.last_skip_at ASC
+        """, (class_id, day_of_week, period, semester))
+        
+        return [dict(row) for row in cursor.fetchall()]
+    
+    def clear_skipped_teachers(self, class_id=None, day_of_week=None, period=None):
+        """清除跳过记录（可选按班级/星期/节次筛选）"""
+        cursor = self.conn.cursor()
+        semester = '2024-2025-1'
+        
+        if class_id and day_of_week and period:
+            cursor.execute("""
+                DELETE FROM teacher_skip_records 
+                WHERE class_id = ? AND day_of_week = ? AND period = ? AND semester = ?
+            """, (class_id, day_of_week, period, semester))
+        else:
+            cursor.execute("DELETE FROM teacher_skip_records WHERE semester = ?", (semester,))
+        
+        self.conn.commit()
+    
+    def get_class_teachers_with_course_order(self, class_id):
+        """获取班级教师，按科目顺序排列"""
+        df = pd.read_sql("""
+            SELECT DISTINCT t.id, t.name, t.course_types,
+                   s.course_name,
+                   CASE 
+                       WHEN t.course_types = '语文' THEN 0
+                       WHEN t.course_types = '数学' THEN 1
+                       WHEN t.course_types = '英语' THEN 2
+                       WHEN t.course_types = '物理' THEN 3
+                       WHEN t.course_types = '化学' THEN 4
+                       WHEN t.course_types = '道法' THEN 5
+                       WHEN t.course_types = '历史' THEN 6
+                       WHEN t.course_types = '生物' THEN 7
+                       WHEN t.course_types = '地理' THEN 8
+                       WHEN t.course_types = '音乐' THEN 9
+                       WHEN t.course_types = '体育' THEN 10
+                       WHEN t.course_types = '美术' THEN 11
+                       WHEN t.course_types = '信息技术' THEN 12
+                       WHEN t.course_types = '劳动' THEN 13
+                       ELSE 99
+                   END as course_order
+            FROM schedule_items s
+            JOIN teachers t ON s.teacher_id = t.id
+            WHERE s.class_id = ? AND t.is_active = 1
+            ORDER BY course_order, t.name
+        """, self.conn, params=(class_id,))
+        return df
+    
+    def get_teachers_by_course_order(self, class_id, day_of_week, period, exclude_teachers=None):
+        """获取某时段可顶课的教师，按科目顺序优先推荐"""
+        cursor = self.conn.cursor()
+        exclude = exclude_teachers or []
+        
+        query = """
+            SELECT DISTINCT t.id, t.name, t.course_types,
+                   CASE 
+                       WHEN t.course_types = '语文' THEN 0
+                       WHEN t.course_types = '数学' THEN 1
+                       WHEN t.course_types = '英语' THEN 2
+                       WHEN t.course_types = '物理' THEN 3
+                       WHEN t.course_types = '化学' THEN 4
+                       WHEN t.course_types = '道法' THEN 5
+                       WHEN t.course_types = '历史' THEN 6
+                       WHEN t.course_types = '生物' THEN 7
+                       WHEN t.course_types = '地理' THEN 8
+                       WHEN t.course_types = '音乐' THEN 9
+                       WHEN t.course_types = '体育' THEN 10
+                       WHEN t.course_types = '美术' THEN 11
+                       WHEN t.course_types = '信息技术' THEN 12
+                       WHEN t.course_types = '劳动' THEN 13
+                       ELSE 99
+                   END as course_order
+            FROM teachers t
+            WHERE t.is_active = 1
+            AND t.id NOT IN (
+                SELECT teacher_id FROM schedule_items 
+                WHERE class_id = ? AND day_of_week = ? AND period = ?
+            )
+        """
+        
+        params = [class_id, day_of_week, period]
+        
+        if exclude:
+            placeholders = ','.join(['?'] * len(exclude))
+            query += f" AND t.id NOT IN ({placeholders})"
+            params.extend(exclude)
+        
+        query += " ORDER BY course_order, t.name"
+        
+        df = pd.read_sql(query, self.conn, params=params)
+        return df
+    
+    def update_substitution_manual(self, sub_id, substitute_id, operated_by):
+        """手动更新顶课记录"""
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute("""
+            UPDATE substitutions 
+            SET substitute_teacher_id = ?, 
+                assignment_type = 'manual',
+                operated_by = ?,
+                operated_at = ?,
+                status = 'confirmed'
+            WHERE id = ?
+        """, (substitute_id, operated_by, now, sub_id))
+        self.conn.commit()
     
     def close(self):
         self.conn.close()
