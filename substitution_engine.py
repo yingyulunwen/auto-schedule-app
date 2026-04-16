@@ -264,7 +264,7 @@ class SubstitutionEngine:
         return COURSE_ORDER
 
 
-def create_substitution_records(teacher_courses, created_by=None, operated_by=None):
+def create_substitution_records(teacher_courses, created_by=None, operated_by=None, leave_reason=''):
     """
     创建批量顶课记录
     
@@ -272,6 +272,7 @@ def create_substitution_records(teacher_courses, created_by=None, operated_by=No
         teacher_courses: [(class_id, day, period), ...] 请假老师的课程列表
         created_by: 创建人用户ID
         operated_by: 操作人用户ID
+        leave_reason: 请假事宜
     
     Returns:
         list: 顶课结果
@@ -356,6 +357,7 @@ def create_substitution_records(teacher_courses, created_by=None, operated_by=No
                 'period': period,
                 'course_type': course_type,
                 'original_course': course_name,
+                'leave_reason': leave_reason,  # 保存请假事宜
                 'assignment_type': plan.get('assignment_type', 'auto'),
                 'status': 'confirmed' if plan['success'] else 'pending',
                 'created_by': created_by,
@@ -390,6 +392,7 @@ def create_substitution_records(teacher_courses, created_by=None, operated_by=No
                 'course_type': course_type,
                 'absent_teacher': absent_teacher['name'],
                 'absent_teacher_id': absent_teacher_id,
+                'leave_reason': leave_reason,  # 包含请假事宜
                 'substitute_teacher': plan['teacher_name'] or '待分配',
                 'substitute_teacher_id': plan['substitute_id'],
                 'assignment_type': plan.get('assignment_type', 'auto'),

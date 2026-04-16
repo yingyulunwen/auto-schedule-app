@@ -95,12 +95,12 @@ class Database:
         """)
         
         # 科目顺序列表（固定顺序，用于顶课分配）
-COURSE_ORDER = [
-    '语文', '数学', '英语', '物理', '化学', '道法', '历史', '生物', 
-    '地理', '音乐', '体育', '美术', '信息技术', '劳动'
-]
-
-# 教师排课冲突记录表
+        COURSE_ORDER = [
+            '语文', '数学', '英语', '物理', '化学', '道法', '历史', '生物', 
+            '地理', '音乐', '体育', '美术', '信息技术', '劳动'
+        ]
+        
+        # 教师排课冲突记录表
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS teacher_skip_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +129,7 @@ COURSE_ORDER = [
                 period INTEGER NOT NULL,
                 course_type TEXT NOT NULL,
                 original_course TEXT,
+                leave_reason TEXT DEFAULT '',
                 assignment_type TEXT DEFAULT 'auto',
                 created_by INTEGER,
                 operated_by INTEGER,
@@ -171,6 +172,23 @@ COURSE_ORDER = [
         cursor.execute("SELECT COUNT(*) FROM evening_pointer")
         if cursor.fetchone()[0] == 0:
             cursor.execute("INSERT INTO evening_pointer (id, current_index) VALUES (1, -1)")
+        
+        # 数据库迁移：添加 leave_reason 字段（如果不存在）
+        try:
+            cursor.execute("ALTER TABLE substitutions ADD COLUMN leave_reason TEXT DEFAULT ''")
+        except:
+            pass
+        
+        # 迁移：确保 evening_assigned 表存在（用于跟踪已分配的晚自习教师）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS evening_assigned (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_id INTEGER NOT NULL,
+                rotation_id INTEGER,
+                assigned_date TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         
         self.conn.commit()
     
@@ -236,6 +254,42 @@ COURSE_ORDER = [
             WHERE s.teacher_id = ?
             ORDER BY s.day_of_week, s.period
         """, self.conn, params=(teacher_id,))
+        return df
+    
+    def update_teacher_name(self, teacher_id, new_name):
+        """修改教师姓名"""
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE teachers SET name = ? WHERE id = ?", (new_name, teacher_id))
+        self.conn.commit()
+        return cursor.rowcount > 0
+    
+    def add_teacher(self, name):
+        """添加教师"""
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("INSERT INTO teachers (name) VALUES (?)", (name,))
+            self.conn.commit()
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            return None  # 教师已存在
+    
+    def delete_teacher(self, teacher_id):
+        """删除教师（软删除，设为非活跃）"""
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE teachers SET is_active = 0 WHERE id = ?", (teacher_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+    
+    def reactivate_teacher(self, teacher_id):
+        """重新激活教师"""
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE teachers SET is_active = 1 WHERE id = ?", (teacher_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+    
+    def get_all_teachers_including_inactive(self):
+        """获取所有教师（包括已删除的）"""
+        df = pd.read_sql("SELECT * FROM teachers ORDER BY is_active DESC, name", self.conn)
         return df
     
     def get_teacher_schedule_by_day(self, teacher_id, day_of_week):
@@ -329,6 +383,57 @@ COURSE_ORDER = [
         cursor.execute("DELETE FROM classes")
         self.conn.commit()
     
+    def update_schedule_teacher(self, schedule_item_id, new_teacher_id):
+        """修改课表的任课教师"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE schedule_items SET teacher_id = ? WHERE id = ?",
+            (new_teacher_id, schedule_item_id)
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+    
+    def get_schedule_item(self, schedule_item_id):
+        """获取单条课表记录"""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT s.*, t.name as teacher_name, c.name as class_name, c.grade
+            FROM schedule_items s
+            JOIN teachers t ON s.teacher_id = t.id
+            JOIN classes c ON s.class_id = c.id
+            WHERE s.id = ?
+        """, (schedule_item_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    
+    def delete_schedule_item(self, schedule_item_id):
+        """删除课表记录"""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM schedule_items WHERE id = ?", (schedule_item_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+    
+    def add_schedule_item(self, class_id, day_of_week, period, teacher_id, course_name, is_evening=0):
+        """添加课表记录"""
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO schedule_items 
+                (class_id, day_of_week, period, teacher_id, course_name, is_evening)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (class_id, day_of_week, period, teacher_id, course_name, is_evening))
+            self.conn.commit()
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            # 如果已存在，更新
+            cursor.execute("""
+                UPDATE schedule_items 
+                SET teacher_id = ?, course_name = ?, is_evening = ?
+                WHERE class_id = ? AND day_of_week = ? AND period = ?
+            """, (teacher_id, course_name, is_evening, class_id, day_of_week, period))
+            self.conn.commit()
+            return cursor.lastrowid
+    
     def get_available_teachers_for_class(self, class_id, day_of_week, period, exclude_teachers=None):
         """获取某班级某时段可顶课的教师（正课）"""
         cursor = self.conn.cursor()
@@ -381,6 +486,77 @@ COURSE_ORDER = [
             ORDER BY r.order_index
         """, self.conn)
         return df
+    
+    def get_evening_assigned_teachers(self):
+        """获取已安排的晚自习教师列表（按姓名排序）"""
+        df = pd.read_sql("""
+            SELECT DISTINCT t.id, t.name, t.course_types
+            FROM teachers t
+            JOIN schedule_items s ON t.id = s.teacher_id
+            WHERE s.is_evening = 1 AND t.is_active = 1
+            UNION
+            SELECT DISTINCT t.id, t.name, t.course_types
+            FROM teachers t
+            JOIN evening_rotation r ON t.id = r.teacher_id
+            WHERE t.is_active = 1
+            ORDER BY name
+        """, self.conn)
+        return df
+    
+    def get_evening_unassigned_teachers(self):
+        """获取未安排晚自习的教师列表"""
+        # 获取已安排晚自习的教师
+        assigned = self.get_evening_assigned_teachers()
+        assigned_ids = assigned['id'].tolist() if not assigned.empty else []
+        
+        # 获取所有活跃教师
+        all_teachers = self.get_all_teachers()
+        
+        if assigned_ids:
+            unassigned = all_teachers[~all_teachers['id'].isin(assigned_ids)]
+        else:
+            unassigned = all_teachers
+        
+        return unassigned.sort_values('name')
+    
+    def add_teacher_to_evening_rotation(self, teacher_id):
+        """添加教师到晚自习轮值表"""
+        cursor = self.conn.cursor()
+        # 获取当前最大order_index
+        cursor.execute("SELECT MAX(order_index) FROM evening_rotation")
+        max_idx = cursor.fetchone()[0] or -1
+        cursor.execute(
+            "INSERT INTO evening_rotation (teacher_id, order_index) VALUES (?, ?)",
+            (teacher_id, max_idx + 1)
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+    
+    def remove_teacher_from_evening_rotation(self, teacher_id):
+        """从晚自习轮值表移除教师"""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM evening_rotation WHERE teacher_id = ?", (teacher_id,))
+        # 重新排序
+        cursor.execute("""
+            UPDATE evening_rotation 
+            SET order_index = (
+                SELECT COUNT(*) FROM evening_rotation r2 
+                WHERE r2.order_index < evening_rotation.order_index
+            )
+        """)
+        self.conn.commit()
+        return cursor.rowcount > 0
+    
+    def reorder_evening_rotation(self, ordered_teacher_ids):
+        """重新排序晚自习轮值表"""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM evening_rotation")
+        for idx, tid in enumerate(ordered_teacher_ids):
+            cursor.execute(
+                "INSERT INTO evening_rotation (teacher_id, order_index) VALUES (?, ?)",
+                (tid, idx)
+            )
+        self.conn.commit()
     
     def assign_evening_duty(self):
         """分配下一个晚自习值班教师"""
@@ -443,8 +619,8 @@ COURSE_ORDER = [
         cursor.execute("""
             INSERT INTO substitutions 
             (absent_teacher_id, substitute_teacher_id, class_id, day_of_week, period,
-             course_type, original_course, status, created_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             course_type, original_course, leave_reason, status, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             data['absent_teacher_id'],
             data.get('substitute_teacher_id'),
@@ -453,6 +629,7 @@ COURSE_ORDER = [
             data['period'],
             data['course_type'],
             data.get('original_course', ''),
+            data.get('leave_reason', ''),  # 请假事宜
             data.get('status', 'pending'),
             data.get('created_by')
         ))
@@ -506,6 +683,70 @@ COURSE_ORDER = [
             WHERE sub.substitute_teacher_id = ? AND sub.status = 'confirmed'
             ORDER BY sub.day_of_week, sub.period
         """, self.conn, params=(teacher_id,))
+        return df
+    
+    def get_my_leave_records(self, teacher_id):
+        """获取我请假被顶的记录（请假记录）"""
+        df = pd.read_sql("""
+            SELECT sub.*,
+                   st.name as substitute_teacher_name,
+                   c.name as class_name, c.grade
+            FROM substitutions sub
+            LEFT JOIN teachers st ON sub.substitute_teacher_id = st.id
+            JOIN classes c ON sub.class_id = c.id
+            WHERE sub.absent_teacher_id = ? AND sub.status = 'confirmed'
+            ORDER BY sub.day_of_week, sub.period
+        """, self.conn, params=(teacher_id,))
+        return df
+    
+    def get_teacher_substitutions_filtered(self, teacher_id, start_date=None, end_date=None):
+        """获取教师顶课记录（帮别人顶的），支持时间筛选"""
+        query = """
+            SELECT sub.*,
+                   at.name as absent_teacher_name,
+                   c.name as class_name, c.grade
+            FROM substitutions sub
+            JOIN teachers at ON sub.absent_teacher_id = at.id
+            JOIN classes c ON sub.class_id = c.id
+            WHERE sub.substitute_teacher_id = ? AND sub.status = 'confirmed'
+        """
+        params = [teacher_id]
+        
+        if start_date:
+            query += " AND sub.created_at >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND sub.created_at <= ?"
+            params.append(end_date)
+        
+        query += " ORDER BY sub.day_of_week, sub.period"
+        
+        df = pd.read_sql(query, self.conn, params=params)
+        return df
+    
+    def get_teacher_leave_records_filtered(self, teacher_id, start_date=None, end_date=None):
+        """获取教师请假记录，支持时间筛选"""
+        query = """
+            SELECT sub.*,
+                   st.name as substitute_teacher_name,
+                   c.name as class_name, c.grade
+            FROM substitutions sub
+            LEFT JOIN teachers st ON sub.substitute_teacher_id = st.id
+            JOIN classes c ON sub.class_id = c.id
+            WHERE sub.absent_teacher_id = ? AND sub.status = 'confirmed'
+        """
+        params = [teacher_id]
+        
+        if start_date:
+            query += " AND sub.created_at >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND sub.created_at <= ?"
+            params.append(end_date)
+        
+        query += " ORDER BY sub.day_of_week, sub.period"
+        
+        df = pd.read_sql(query, self.conn, params=params)
         return df
     
     def update_substitution(self, sub_id, substitute_id, status='confirmed'):
