@@ -39,12 +39,22 @@ def get_grade_from_sheet(sheet_name):
         return '九年级'
     return ''
 
-def import_schedule_to_db():
-    """从Excel导入课表到数据库"""
+def import_schedule_to_db(excel_file=None):
+    """从Excel导入课表到数据库
+    
+    Args:
+        excel_file: Excel文件路径，如果为None则使用默认路径
+    
+    Returns:
+        dict: 导入统计信息
+    """
     db = get_db()
     
-    if not EXCEL_FILE.exists():
-        raise FileNotFoundError(f"课表文件未找到: {EXCEL_FILE}")
+    # 确定要使用的文件路径
+    file_path = excel_file if excel_file else EXCEL_FILE
+    
+    if not Path(file_path).exists():
+        raise FileNotFoundError(f"课表文件未找到: {file_path}")
     
     # 清空旧数据
     db.clear_schedule()
@@ -53,10 +63,10 @@ def import_schedule_to_db():
     classes_list = []
     schedule_records = []
     
-    wb = openpyxl.load_workbook(EXCEL_FILE, read_only=True)
+    wb = openpyxl.load_workbook(file_path, read_only=True)
     
     for sheet_name in wb.sheetnames:
-        df = pd.read_excel(EXCEL_FILE, sheet_name=sheet_name, header=None)
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
         class_name = sheet_name
         grade = get_grade_from_sheet(sheet_name)
         classes_list.append((class_name, grade))

@@ -12,10 +12,10 @@ PERIOD_NAMES = {
     10: '晚1节', 11: '晚2节'
 }
 
-# 科目顺序列表
+# 科目顺序列表 - 17个位置，语数英重复
 COURSE_ORDER = [
     '语文', '数学', '英语', '物理', '化学', '道法', '历史', '生物', 
-    '地理', '音乐', '体育', '美术', '信息技术', '劳动'
+    '地理', '语文', '数学', '英语', '音乐', '体育', '美术', '信息技术', '劳动'
 ]
 
 
@@ -50,20 +50,20 @@ class SubstitutionEngine:
             return self._assign_regular_class(absent_teacher_id, class_id, day_of_week, period, course_name)
     
     def _assign_regular_class(self, absent_teacher_id, class_id, day_of_week, period, course_name=None):
-        """分配正课顶替教师（按科目顺序，跳过有冲突教师，优先考虑被跳过的教师）"""
+        """分配正课顶替教师（从请假教师所教班级的任课老师中选取，按科目顺序）"""
         
         # 排除列表：请假教师 + 已分配的教师
         exclude = [absent_teacher_id] + self.assigned_teachers
         
-        # 获取所有可用教师（按科目顺序）
-        available = self.db.get_teachers_by_course_order(class_id, day_of_week, period, exclude)
+        # 获取请假教师所教班级的所有可顶课教师（使用新的核心逻辑）
+        available = self.db.get_available_substitute_teachers(absent_teacher_id, day_of_week, period, exclude)
         
         if available.empty:
             return {
                 'success': False,
                 'substitute_id': None,
                 'teacher_name': None,
-                'message': '该时段无空闲教师',
+                'message': '该时段无空闲教师（请假教师所教班级范围内）',
                 'assignment_type': 'auto',
                 'all_available': [],
                 'conflict_teachers': []
@@ -73,7 +73,7 @@ class SubstitutionEngine:
         conflict_teachers = []
         
         # 获取所有可能顶课的教师（不排除assigned的）
-        all_potential = self.db.get_teachers_by_course_order(class_id, day_of_week, period, [absent_teacher_id])
+        all_potential = self.db.get_available_substitute_teachers(absent_teacher_id, day_of_week, period, [absent_teacher_id])
         if not all_potential.empty:
             for _, row in all_potential.iterrows():
                 if row['id'] in self.assigned_teachers:
@@ -84,7 +84,8 @@ class SubstitutionEngine:
                     })
         
         # 获取被跳过过的教师（按跳过次数优先）
-        skipped_list = self.db.get_skipped_teachers(class_id, day_of_week, period)
+        # 注意：跳过记录仍然按班级记录，但查询时改为在请假教师所教班级范围内
+        skipped_list = self._get_skipped_teachers_in_scope(absent_teacher_id, class_id, day_of_week, period)
         
         # 优先选择被跳过过的教师
         priority_teachers = [t for t in skipped_list if t['id'] not in exclude]
@@ -96,9 +97,6 @@ class SubstitutionEngine:
             # 选择跳过次数最多的教师
             chosen = priority_teachers[0]
             assignment_type = 'auto_priority'  # 自动分配但优先处理历史冲突
-            
-            # 从跳过记录中移除（因为现在分配了）
-            # 注意：保留记录用于统计，跳过次数会自然递减（下次循环从头开始）
         else:
             # 按科目顺序选择第一个可用的
             if not available.empty:
@@ -108,9 +106,6 @@ class SubstitutionEngine:
         if chosen:
             chosen_id = chosen['id'] if isinstance(chosen, dict) else chosen['id']
             self.assigned_teachers.append(chosen_id)
-            
-            # 如果之前被跳过过，清除其跳过记录（新的一轮开始）
-            self._clear_skip_if_exists(chosen_id, class_id, day_of_week, period)
             
             teacher_name = chosen['name'] if isinstance(chosen, dict) else chosen['name']
             
@@ -134,6 +129,39 @@ class SubstitutionEngine:
             'all_available': available.to_dict('records') if not available.empty else [],
             'conflict_teachers': conflict_teachers
         }
+    
+    def _get_skipped_teachers_in_scope(self, absent_teacher_id, class_id, day_of_week, period):
+        """获取请假教师所教班级范围内被跳过过的教师"""
+        # 获取请假教师所教的所有班级
+        classes_of_absent = self.db.get_teachers_of_teacher(absent_teacher_id)
+        if classes_of_absent.empty:
+            return []
+        
+        # 获取这些班级的任课老师中有跳过记录的
+        # 简化为返回该范围内的跳过记录
+        cursor = self.db.conn.cursor()
+        semester = '2024-2025-1'
+        
+        # 获取请假教师所教班级
+        cursor.execute("""
+            SELECT DISTINCT class_id FROM schedule_items WHERE teacher_id = ?
+        """, (absent_teacher_id,))
+        class_ids = [row[0] for row in cursor.fetchall()]
+        
+        if not class_ids:
+            return []
+        
+        placeholders = ','.join(['?'] * len(class_ids))
+        cursor.execute(f"""
+            SELECT t.id, t.name, s.skip_count, s.last_skip_at
+            FROM teacher_skip_records s
+            JOIN teachers t ON s.teacher_id = t.id
+            WHERE s.class_id IN ({placeholders}) AND s.day_of_week = ? AND s.period = ? 
+            AND s.semester = ?
+            ORDER BY s.skip_count DESC, s.last_skip_at ASC
+        """, class_ids + [day_of_week, period, semester])
+        
+        return [dict(row) for row in cursor.fetchall()]
     
     def _clear_skip_if_exists(self, teacher_id, class_id, day_of_week, period):
         """清除指定教师的跳过记录"""
@@ -200,8 +228,8 @@ class SubstitutionEngine:
         """获取指定时段有冲突的教师列表"""
         exclude = [absent_teacher_id] + self.assigned_teachers
         
-        # 获取所有可能顶课的教师
-        all_potential = self.db.get_teachers_by_course_order(class_id, day_of_week, period, [absent_teacher_id])
+        # 获取所有可能顶课的教师（使用新的核心逻辑）
+        all_potential = self.db.get_available_substitute_teachers(absent_teacher_id, day_of_week, period, [absent_teacher_id])
         
         conflict = []
         if not all_potential.empty:

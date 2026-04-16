@@ -905,14 +905,21 @@ def render_profile_page():
         
         if not all_subs.empty:
             # 筛选
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             with col1:
+                teacher_filter = st.selectbox(
+                    "按教师姓名筛选",
+                    options=['全部'] + sorted(all_subs['absent_teacher_name'].unique().tolist() + 
+                           all_subs['substitute_teacher_name'].dropna().unique().tolist()),
+                    index=0
+                )
+            with col2:
                 type_filter = st.selectbox(
                     "按类型筛选",
                     options=['全部', '正课', '晚自习'],
                     index=0
                 )
-            with col2:
+            with col3:
                 status_filter = st.selectbox(
                     "按状态筛选",
                     options=['全部', 'pending', 'confirmed', 'failed'],
@@ -920,6 +927,13 @@ def render_profile_page():
                 )
             
             filtered = all_subs.copy()
+            
+            # 教师姓名筛选
+            if teacher_filter != '全部':
+                filtered = filtered[
+                    (filtered['absent_teacher_name'] == teacher_filter) | 
+                    (filtered['substitute_teacher_name'] == teacher_filter)
+                ]
             if type_filter == '正课':
                 filtered = filtered[filtered['course_type'] == '正课']
             elif type_filter == '晚自习':
@@ -972,7 +986,7 @@ def render_data_management_page():
         return
     
     # Tab 页面
-    tab1, tab2, tab3 = st.tabs(["👨‍🏫 教师管理", "📅 课表管理", "🏫 班级管理"])
+    tab1, tab2, tab3, tab4 = st.tabs(["👨‍🏫 教师管理", "📅 课表管理", "🏫 班级管理", "📤 上传Excel"])
     
     with tab1:
         st.markdown("#### 👨‍🏫 教师管理")
@@ -1126,6 +1140,96 @@ def render_data_management_page():
                     # 显示该班级的课程数量
                     class_schedule = db.get_class_schedule(row['id'])
                     st.caption(f"共 {len(class_schedule)} 节课" if not class_schedule.empty else "暂无课表")
+    
+    with tab4:
+        st.markdown("#### 📤 上传Excel课表")
+        st.markdown("上传新的课表Excel文件，系统将自动解析并更新数据库")
+        
+        # 上传文件
+        uploaded_file = st.file_uploader(
+            "选择Excel文件",
+            type=['xlsx', 'xls'],
+            help="支持 .xlsx 和 .xls 格式的Excel文件"
+        )
+        
+        if uploaded_file is not None:
+            st.info(f"已选择文件: {uploaded_file.name}")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("**文件信息**")
+                st.write(f"- 文件名: {uploaded_file.name}")
+                st.write(f"- 文件大小: {uploaded_file.size / 1024:.2f} KB")
+            
+            with col2:
+                st.markdown("**操作说明**")
+                st.markdown("""
+                1. 上传Excel文件
+                2. 点击「确认上传」按钮
+                3. 系统将自动解析并更新数据库
+                4. 原有数据将被覆盖
+                """)
+            
+            st.markdown("---")
+            
+            if st.button("📤 确认上传并更新数据库", type="primary", use_container_width=True):
+                try:
+                    # 保存上传的文件到临时目录
+                    import tempfile
+                    import os
+                    from pathlib import Path
+                    
+                    # 创建临时目录
+                    temp_dir = Path(__file__).parent / "data" / "temp_uploads"
+                    temp_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # 保存文件
+                    temp_file = temp_dir / uploaded_file.name
+                    with open(temp_file, 'wb') as f:
+                        f.write(uploaded_file.getbuffer())
+                    
+                    with st.spinner("正在解析并导入数据..."):
+                        result = import_schedule_to_db(str(temp_file))
+                    
+                    # 清理临时文件
+                    if temp_file.exists():
+                        os.remove(temp_file)
+                    
+                    st.success(f"""
+                    ✅ 上传并导入成功！
+                    
+                    - 教师: {result['teachers']} 位
+                    - 班级: {result['classes']} 个
+                    - 课表记录: {result['schedule_items']} 条
+                    """)
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ 上传失败: {str(e)}")
+                    import traceback
+                    with st.expander("查看详细错误"):
+                        st.code(traceback.format_exc())
+        else:
+            st.info("请上传Excel课表文件")
+            
+            # 显示格式要求
+            with st.expander("📋 Excel格式要求", expanded=True):
+                st.markdown("""
+                **Excel文件应包含以下结构：**
+                
+                1. 每个Sheet对应一个班级，Sheet名称即为班级名称（如"七年级1班"）
+                2. Sheet中应包含：
+                   - 第1-3行：表头信息（将被忽略）
+                   - 第4行起：课程数据
+                   - 第2列（B列）：节次（1-11）
+                   - 第3-7列（C-G列）：周一至周五的课程
+                
+                **课程单元格格式：**
+                - 课程名称
+                - 教师姓名（用括号或圆括号包裹）
+                - 例如：`语文\n（张三）`
+                """)
     
     # 数据初始化（保留在底部）
     st.markdown("---")

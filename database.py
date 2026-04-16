@@ -10,10 +10,10 @@ import pandas as pd
 # 数据库路径
 DB_PATH = Path(__file__).parent / "data" / "schedule.db"
 
-# 科目顺序列表（固定顺序，用于顶课分配）
+# 科目顺序列表（固定顺序，用于顶课分配）- 17个位置，语数英重复
 COURSE_ORDER = [
     '语文', '数学', '英语', '物理', '化学', '道法', '历史', '生物', 
-    '地理', '音乐', '体育', '美术', '信息技术', '劳动'
+    '地理', '语文', '数学', '英语', '音乐', '体育', '美术', '信息技术', '劳动'
 ]
 
 class Database:
@@ -613,6 +613,159 @@ class Database:
         return dict(row) if row else None
     
     # ==================== 顶课记录相关 ====================
+    
+    def get_substitutions_by_teacher_name(self, teacher_name):
+        """
+        按教师姓名筛选调课记录（请假或顶课）
+        
+        Args:
+            teacher_name: 教师姓名
+        
+        Returns:
+            DataFrame: 该教师的调课和顶课记录
+        """
+        query = """
+            SELECT sub.*,
+                   at.name as absent_teacher_name,
+                   st.name as substitute_teacher_name,
+                   c.name as class_name, c.grade
+            FROM substitutions sub
+            JOIN teachers at ON sub.absent_teacher_id = at.id
+            LEFT JOIN teachers st ON sub.substitute_teacher_id = st.id
+            JOIN classes c ON sub.class_id = c.id
+            WHERE (at.name LIKE ? OR st.name LIKE ?)
+            ORDER BY sub.day_of_week, sub.period
+        """
+        like_pattern = f"%{teacher_name}%"
+        df = pd.read_sql(query, self.conn, params=[like_pattern, like_pattern])
+        return df
+    
+    def get_teachers_of_teacher(self, teacher_id):
+        """
+        获取请假教师所教班级的所有任课老师
+        
+        Args:
+            teacher_id: 请假教师ID
+        
+        Returns:
+            DataFrame: 请假教师所教班级的所有任课老师
+        """
+        # 首先获取该请假教师所教的所有班级
+        query = """
+            SELECT DISTINCT class_id
+            FROM schedule_items
+            WHERE teacher_id = ?
+        """
+        df_classes = pd.read_sql(query, self.conn, params=[teacher_id])
+        
+        if df_classes.empty:
+            return pd.DataFrame()
+        
+        class_ids = df_classes['class_id'].tolist()
+        placeholders = ','.join(['?'] * len(class_ids))
+        
+        # 获取这些班级的所有任课老师（排除请假教师自己）
+        query = f"""
+            SELECT DISTINCT t.id, t.name, t.course_types
+            FROM schedule_items s
+            JOIN teachers t ON s.teacher_id = t.id
+            WHERE s.class_id IN ({placeholders})
+            AND t.is_active = 1
+            AND t.id != ?
+            ORDER BY t.name
+        """
+        params = class_ids + [teacher_id]
+        df = pd.read_sql(query, self.conn, params=params)
+        return df
+    
+    def get_available_substitute_teachers(self, absent_teacher_id, day_of_week, period, exclude_teachers=None):
+        """
+        获取请假教师所教班级中指定时段可顶课的教师（按科目顺序）
+        
+        核心逻辑变更：从"本班任课老师"改为"请假教师所教班级的任课老师"
+        
+        Args:
+            absent_teacher_id: 请假教师ID
+            day_of_week: 星期几
+            period: 第几节课
+            exclude_teachers: 需要排除的教师ID列表
+        
+        Returns:
+            DataFrame: 可顶课的教师列表
+        """
+        cursor = self.conn.cursor()
+        exclude = exclude_teachers or []
+        
+        # 获取请假教师所教的所有班级
+        query_classes = """
+            SELECT DISTINCT class_id
+            FROM schedule_items
+            WHERE teacher_id = ?
+        """
+        df_classes = pd.read_sql(query_classes, self.conn, params=[absent_teacher_id])
+        
+        if df_classes.empty:
+            return pd.DataFrame()
+        
+        class_ids = df_classes['class_id'].tolist()
+        class_placeholders = ','.join(['?'] * len(class_ids))
+        
+        # 构建科目顺序的CASE语句（17项）
+        course_order_cases = """
+            CASE 
+                WHEN t.course_types = '语文' THEN 
+                    CASE WHEN s.period = (SELECT MIN(s2.period) FROM schedule_items s2 WHERE s2.teacher_id = t.id AND s2.course_name = '语文' AND s2.class_id IN ({class_placeholders}) AND s2.day_of_week = {day} AND s2.period = {period}) THEN 0
+                         ELSE 9
+                    END
+                WHEN t.course_types = '数学' THEN 
+                    CASE WHEN s.period = (SELECT MIN(s2.period) FROM schedule_items s2 WHERE s2.teacher_id = t.id AND s2.course_name = '数学' AND s2.class_id IN ({class_placeholders}) AND s2.day_of_week = {day} AND s2.period = {period}) THEN 1
+                         ELSE 10
+                    END
+                WHEN t.course_types = '英语' THEN 
+                    CASE WHEN s.period = (SELECT MIN(s2.period) FROM schedule_items s2 WHERE s2.teacher_id = t.id AND s2.course_name = '英语' AND s2.class_id IN ({class_placeholders}) AND s2.day_of_week = {day} AND s2.period = {period}) THEN 2
+                         ELSE 11
+                    END
+                WHEN t.course_types = '物理' THEN 3
+                WHEN t.course_types = '化学' THEN 4
+                WHEN t.course_types = '道法' THEN 5
+                WHEN t.course_types = '历史' THEN 6
+                WHEN t.course_types = '生物' THEN 7
+                WHEN t.course_types = '地理' THEN 8
+                WHEN t.course_types = '音乐' THEN 12
+                WHEN t.course_types = '体育' THEN 13
+                WHEN t.course_types = '美术' THEN 14
+                WHEN t.course_types = '信息技术' THEN 15
+                WHEN t.course_types = '劳动' THEN 16
+                ELSE 99
+            END as course_order
+        """.format(class_placeholders=class_placeholders, day=day_of_week, period=period)
+        
+        # 获取在请假教师所教班级中该时段有课的教师（即那些班级此时段被顶课，他们有空）
+        # 同时排除该时段已在任何班级有课的教师
+        query = f"""
+            SELECT DISTINCT t.id, t.name, t.course_types
+            FROM teachers t
+            JOIN schedule_items s ON t.id = s.teacher_id
+            WHERE s.class_id IN ({class_placeholders})
+            AND t.is_active = 1
+            AND t.id != ?
+            AND t.id NOT IN (
+                SELECT teacher_id FROM schedule_items 
+                WHERE class_id IN ({class_placeholders}) AND day_of_week = ? AND period = ?
+            )
+        """
+        
+        params = [absent_teacher_id] + class_ids + [absent_teacher_id] + class_ids + [day_of_week, period]
+        
+        if exclude:
+            placeholders = ','.join(['?'] * len(exclude))
+            query += f" AND t.id NOT IN ({placeholders})"
+            params.extend(exclude)
+        
+        query += " ORDER BY t.name"
+        
+        df = pd.read_sql(query, self.conn, params=params)
+        return df
     
     def create_substitution(self, data):
         cursor = self.conn.cursor()
